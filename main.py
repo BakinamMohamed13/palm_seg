@@ -1,39 +1,36 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import Image
 import numpy as np
-import io
-import pickle
-import uvicorn
-import os
 import cv2
+from PIL import Image
+import io
+import os
+import joblib  # use joblib for loading sklearn models
 from tensorflow.keras.models import load_model
+import uvicorn
 
 app = FastAPI()
 
-# CORS configuration
+# CORS config
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can replace * with your Flutter frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === Load Models ===
+# Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Load segmentation model (.h5)
 seg_model_path = os.path.join(BASE_DIR, "palm_segmentation_model.h5")
-seg_model = load_model(seg_model_path, compile=False)
-
-# Load classifier (.pkl)
 clf_model_path = os.path.join(BASE_DIR, "RF-balancedPalm.pkl")
-with open(clf_model_path, "rb") as f:
-    model = pickle.load(f)
 
-# === Helper Functions ===
+# Load models
+seg_model = load_model(seg_model_path, compile=False)
+clf_model = joblib.load(clf_model_path)
+
+# ========= Helper Functions =========
 
 def preprocess_for_segmentation(image_data, target_size=(128, 128)):
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
@@ -42,24 +39,34 @@ def preprocess_for_segmentation(image_data, target_size=(128, 128)):
     return image_np
 
 def segment_palm(image_np):
-    input_img = np.expand_dims(image_np, axis=0)  # (1, 128, 128, 3)
+    input_img = np.expand_dims(image_np, axis=0)  # shape: (1, 128, 128, 3)
     prediction = seg_model.predict(input_img)[0]
 
     mask = (prediction > 0.5).astype(np.uint8)
     if mask.ndim == 3:
         mask = mask[:, :, 0]
-    mask = cv2.resize(mask, (128, 128), interpolation=cv2.INTER_NEAREST)
-
     segmented = (image_np * mask[:, :, np.newaxis]).astype(np.float32)
     return segmented
 
-def flatten_image(image_np):
-    resized = cv2.resize(image_np, (224, 224))  # Resize to match model input
-    normalized = resized / 1.0
-    flat = normalized.flatten().reshape(1, -1)
-    return flat
+def extract_color_histogram(image_np, bins=64):
+    # Expecting image_np in range [0,1], shape: (128,128,3)
+    image_uint8 = (image_np * 255).astype(np.uint8)
 
-# === API Endpoints ===
+    hist_features = []
+    for channel in range(3):  # RGB channels
+        hist = cv2.calcHist([image_uint8], [channel], None, [bins], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        hist_features.extend(hist)
+
+    # Total features: 64 * 3 = 192
+    # Pad or repeat to reach 512
+    if len(hist_features) < 512:
+        repeats = (512 + len(hist_features) - 1) // len(hist_features)
+        hist_features = (hist_features * repeats)[:512]
+
+    return np.array(hist_features).reshape(1, -1)
+
+# ========= API Endpoints =========
 
 @app.post("/predict")
 async def predict_anemia(file: UploadFile = File(...)):
@@ -69,19 +76,18 @@ async def predict_anemia(file: UploadFile = File(...)):
 
         contents = await file.read()
 
-        # Step 1: Segment palm
+        # Palm Segmentation
         img_np = preprocess_for_segmentation(contents)
         segmented = segment_palm(img_np)
 
-        # Check if segmentation mask failed
         if np.sum(segmented) == 0:
             return {"error": "Palm region could not be detected. Try a clearer image."}
 
-        # Step 2: Flatten for classification
-        flat_input = flatten_image(segmented)
+        # Feature Extraction
+        features = extract_color_histogram(segmented)
 
-        # Step 3: Predict
-        prediction = model.predict(flat_input)
+        # Prediction
+        prediction = clf_model.predict(features)
         label = "Anemic" if prediction[0] == 1 else "Non-Anemic"
 
         return {"label": label}
@@ -98,6 +104,7 @@ async def serve_html():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>index.html not found</h1>", status_code=404)
 
-# === Run Server ===
+# ========= Run Server =========
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, port=8000)
