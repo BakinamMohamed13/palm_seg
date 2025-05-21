@@ -71,9 +71,9 @@ def extract_color_histogram(image_np, bins=64):
 @app.post("/predict")
 async def predict_anemia(file: UploadFile = File(...)):
     try:
-    Image.open(io.BytesIO(contents)).verify()
-except UnidentifiedImageError:
-    return {"error": "Invalid file type. Please upload a valid image."}
+        if not file.content_type.startswith("image/"):
+            return {"error": "Invalid file type. Please upload an image."}
+
 
 
         contents = await file.read()
